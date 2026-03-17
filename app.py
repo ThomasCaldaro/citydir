@@ -142,6 +142,71 @@ def direction_sort_key(direction: str) -> int:
     }
     return order.get(direction, 9)
 
+
+def normalize_direction_value(value) -> str:
+    """Normalize direction codes like NNE / WSW / NE into UI labels."""
+    if pd.isna(value):
+        return ""
+
+    s = str(value).strip().upper()
+    if not s:
+        return ""
+
+    direct = {
+        "N": "North",
+        "NE": "Northeast",
+        "E": "East",
+        "SE": "Southeast",
+        "S": "South",
+        "SW": "Southwest",
+        "W": "West",
+        "NW": "Northwest",
+    }
+    if s in direct:
+        return direct[s]
+
+    # Handle secondary compass points by collapsing to their nearest main/diagonal bucket
+    if "N" in s and "E" in s:
+        return "Northeast"
+    if "S" in s and "E" in s:
+        return "Southeast"
+    if "S" in s and "W" in s:
+        return "Southwest"
+    if "N" in s and "W" in s:
+        return "Northwest"
+    if s.startswith("N"):
+        return "North"
+    if s.startswith("S"):
+        return "South"
+    if s.startswith("E"):
+        return "East"
+    if s.startswith("W"):
+        return "West"
+    return ""
+
+def infer_tp_adj_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Infer TP/ADJ and normalized direction columns for newer city-directory layouts."""
+    cols_upper = {str(col).strip().upper(): col for col in df.columns}
+
+    feet_col = cols_upper.get("FEET")
+    miles_col = cols_upper.get("MILES")
+    dir_col = cols_upper.get("DIR")
+
+    if "TP/ADJ" not in cols_upper and (feet_col or miles_col):
+        def classify_tp_adj(row):
+            vals = []
+            for col_name in [feet_col, miles_col]:
+                if col_name and pd.notna(row[col_name]):
+                    vals.append(str(row[col_name]).strip().upper())
+            return "TP" if "TP" in vals else "ADJ"
+
+        df["TP/ADJ"] = df.apply(classify_tp_adj, axis=1)
+
+    if dir_col and "DIR_STD" not in df.columns:
+        df["DIR_STD"] = df[dir_col].apply(normalize_direction_value)
+
+    return df
+
 def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Find address column(s) and combine them into a single ADDRESS column.
@@ -187,7 +252,6 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
         def combine_street_no_name(row):
             sno = str(row[sno_col]).strip() if pd.notna(row[sno_col]) else ""
             sname = str(row[sname_col]).strip() if pd.notna(row[sname_col]) else ""
-            # Remove trailing .0 from numeric street numbers read as float by pandas
             sno = re.sub(r'\.0$', '', sno)
             combined = f"{sno} {sname}".strip()
             return normalize_addr(combined)
@@ -196,7 +260,23 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
         st.info(f"✓ Combined {sno_col} and {sname_col} into ADDRESS column")
         return df
 
-    # Pattern 5: Look for other common patterns
+    # Pattern 5: NUMBER + STREET columns (new client layout)
+    if "NUMBER" in cols_upper and "STREET" in cols_upper:
+        num_col = cols_upper["NUMBER"]
+        street_col = cols_upper["STREET"]
+
+        def combine_number_street(row):
+            num = str(row[num_col]).strip() if pd.notna(row[num_col]) else ""
+            street = str(row[street_col]).strip() if pd.notna(row[street_col]) else ""
+            num = re.sub(r'\.0$', '', num)
+            combined = f"{num} {street}".strip()
+            return normalize_addr(combined)
+
+        df["ADDRESS"] = df.apply(combine_number_street, axis=1)
+        st.info(f"✓ Combined {num_col} and {street_col} into ADDRESS column")
+        return df
+
+    # Pattern 6: Look for other common patterns
     address_patterns = [
         "STREET ADDRESS", "STREET_ADDRESS", "PROPERTY ADDRESS",
         "PROPERTY_ADDRESS", "SITE ADDRESS", "LOCATION", "STREET", "ADDR"
@@ -484,6 +564,14 @@ def read_input(file) -> pd.DataFrame:
                 header_row = i
                 break
 
+    # If not found, look for newer format (YEAR + NUMBER + STREET + OCCUPANT NAME)
+    if header_row is None:
+        for i in range(min(50, len(raw))):
+            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
+            if "YEAR" in row_vals and "NUMBER" in row_vals and ("STREET" in row_vals or "STREET " in row_vals) and "OCCUPANT NAME" in row_vals:
+                header_row = i
+                break
+
     if header_row is None:
         df = pd.read_excel(xls, sheet_name=0)
         df.columns = [str(c).strip().upper() for c in df.columns]
@@ -760,7 +848,10 @@ if not uploaded:
     st.stop()
 
 df = read_input(uploaded)
-df.columns = [c.upper() for c in df.columns]
+df.columns = [str(c).strip().upper() for c in df.columns]
+
+# Infer newer layout helper columns before downstream processing
+df = infer_tp_adj_columns(df)
 
 # Find and combine address columns
 df = find_and_combine_address_columns(df)
@@ -784,18 +875,38 @@ if "YEAR" not in df.columns:
 
 # Info message for TP/ADJ format
 if "TP/ADJ" in df.columns:
-    tp_count = (df["TP/ADJ"].str.upper() == "TP").sum()
-    adj_count = (df["TP/ADJ"].str.upper() == "ADJ").sum()
+    tp_series = df["TP/ADJ"].astype(str).str.upper().str.strip()
+    tp_count = (tp_series == "TP").sum()
+    adj_count = (tp_series == "ADJ").sum()
     st.info(
-        f"ℹ️ TP/ADJ format detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
-        f"Use the pickers below to select addresses as usual."
+        f"ℹ️ TP/ADJ data detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
+        f"Subject and adjoining pickers below will be filtered automatically when possible."
     )
 
 # ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
 all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
 all_addresses = sorted(all_addresses, key=parse_address_for_sort)
 
-st.success(f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses")
+subject_address_options = all_addresses
+adjoining_address_options = all_addresses
+if "TP/ADJ" in df.columns:
+    tp_series = df["TP/ADJ"].astype(str).str.upper().str.strip()
+    subject_address_options = sorted(
+        [a for a in df.loc[tp_series == "TP", "ADDRESS"].dropna().unique() if str(a).strip()],
+        key=parse_address_for_sort
+    )
+    adjoining_address_options = sorted(
+        [a for a in df.loc[tp_series == "ADJ", "ADDRESS"].dropna().unique() if str(a).strip()],
+        key=parse_address_for_sort
+    )
+
+st.success(
+    f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses"
+    + (
+        f" • {len(subject_address_options):,} subject options • {len(adjoining_address_options):,} adjoining options"
+        if "TP/ADJ" in df.columns else ""
+    )
+)
 
 # Show preview of extracted data if PDF
 if uploaded.name.lower().endswith('.pdf'):
@@ -833,12 +944,12 @@ ui_left, ui_right = st.columns(2)
 
 with ui_left:
     st.subheader("Pick Subject Property Addresses")
-    subject_selected = st.multiselect("Subject addresses", all_addresses, key="subject_sel", placeholder="Choose address")
+    subject_selected = st.multiselect("Subject addresses", subject_address_options, key="subject_sel", placeholder="Choose address")
     st.button("CREATE SUBJECT PROPERTY TABLES", use_container_width=True, on_click=set_run_subject)
 
 with ui_right:
     st.subheader("Pick Adjoining Property Addresses")
-    adjoining_selected = st.multiselect("Adjoining addresses", all_addresses, key="adjoining_sel", placeholder="Choose address")
+    adjoining_selected = st.multiselect("Adjoining addresses", adjoining_address_options, key="adjoining_sel", placeholder="Choose address")
     st.button("CREATE ADJOINING PROPERTY TABLES", use_container_width=True, on_click=set_run_adjoining)
 
 st.button("CLEAR ALL", use_container_width=True, on_click=clear_all)
@@ -879,7 +990,13 @@ with out_right:
             for a in adjoining_selected:
                 key = f"dir_{a}"
                 if a not in st.session_state["dir_map"]:
-                    st.session_state["dir_map"][a] = ""
+                    inferred_dir = ""
+                    if "DIR_STD" in df.columns:
+                        matches = df.loc[df["ADDRESS"] == a, "DIR_STD"].dropna().astype(str)
+                        matches = [m for m in matches if m.strip()]
+                        if matches:
+                            inferred_dir = matches[0]
+                    st.session_state["dir_map"][a] = inferred_dir
                 picked = st.selectbox(a, dir_opts, index=dir_opts.index(st.session_state["dir_map"][a]), key=key)
                 st.session_state["dir_map"][a] = picked
 
