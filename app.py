@@ -880,33 +880,19 @@ if "TP/ADJ" in df.columns:
     adj_count = (tp_series == "ADJ").sum()
     st.info(
         f"ℹ️ TP/ADJ data detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
-        f"Subject and adjoining pickers below will be filtered automatically when possible."
+        f"All unique addresses will be available in both pickers, matching the older file behavior."
     )
 
 # ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
 all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
 all_addresses = sorted(all_addresses, key=parse_address_for_sort)
 
+# Keep the old picker behavior for every format:
+# show the full unique-address list in both the Subject and Adjoining pickers.
 subject_address_options = all_addresses
 adjoining_address_options = all_addresses
-if "TP/ADJ" in df.columns:
-    tp_series = df["TP/ADJ"].astype(str).str.upper().str.strip()
-    subject_address_options = sorted(
-        [a for a in df.loc[tp_series == "TP", "ADDRESS"].dropna().unique() if str(a).strip()],
-        key=parse_address_for_sort
-    )
-    adjoining_address_options = sorted(
-        [a for a in df.loc[tp_series == "ADJ", "ADDRESS"].dropna().unique() if str(a).strip()],
-        key=parse_address_for_sort
-    )
 
-st.success(
-    f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses"
-    + (
-        f" • {len(subject_address_options):,} subject options • {len(adjoining_address_options):,} adjoining options"
-        if "TP/ADJ" in df.columns else ""
-    )
-)
+st.success(f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses")
 
 # Show preview of extracted data if PDF
 if uploaded.name.lower().endswith('.pdf'):
