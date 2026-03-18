@@ -92,6 +92,21 @@ def normalize_addr(addr: str) -> str:
     s = re.sub(r"\s+", " ", s)
     return s
 
+def extract_year_sort_value(value) -> int:
+    """Return the earliest 4-digit year found in a value like 1964-1965."""
+    if pd.isna(value):
+        return 999999
+    s = str(value).strip()
+    if not s or s.upper() == "N/A":
+        return 999999
+    nums = re.findall(r"\d{4}", s)
+    if nums:
+        return int(nums[0])
+    try:
+        return int(float(s))
+    except Exception:
+        return 999999
+
 def parse_address_for_sort(addr: str) -> tuple[str, int, int, str]:
     """
     Sort key:
@@ -142,71 +157,6 @@ def direction_sort_key(direction: str) -> int:
     }
     return order.get(direction, 9)
 
-
-def normalize_direction_value(value) -> str:
-    """Normalize direction codes like NNE / WSW / NE into UI labels."""
-    if pd.isna(value):
-        return ""
-
-    s = str(value).strip().upper()
-    if not s:
-        return ""
-
-    direct = {
-        "N": "North",
-        "NE": "Northeast",
-        "E": "East",
-        "SE": "Southeast",
-        "S": "South",
-        "SW": "Southwest",
-        "W": "West",
-        "NW": "Northwest",
-    }
-    if s in direct:
-        return direct[s]
-
-    # Handle secondary compass points by collapsing to their nearest main/diagonal bucket
-    if "N" in s and "E" in s:
-        return "Northeast"
-    if "S" in s and "E" in s:
-        return "Southeast"
-    if "S" in s and "W" in s:
-        return "Southwest"
-    if "N" in s and "W" in s:
-        return "Northwest"
-    if s.startswith("N"):
-        return "North"
-    if s.startswith("S"):
-        return "South"
-    if s.startswith("E"):
-        return "East"
-    if s.startswith("W"):
-        return "West"
-    return ""
-
-def infer_tp_adj_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """Infer TP/ADJ and normalized direction columns for newer city-directory layouts."""
-    cols_upper = {str(col).strip().upper(): col for col in df.columns}
-
-    feet_col = cols_upper.get("FEET")
-    miles_col = cols_upper.get("MILES")
-    dir_col = cols_upper.get("DIR")
-
-    if "TP/ADJ" not in cols_upper and (feet_col or miles_col):
-        def classify_tp_adj(row):
-            vals = []
-            for col_name in [feet_col, miles_col]:
-                if col_name and pd.notna(row[col_name]):
-                    vals.append(str(row[col_name]).strip().upper())
-            return "TP" if "TP" in vals else "ADJ"
-
-        df["TP/ADJ"] = df.apply(classify_tp_adj, axis=1)
-
-    if dir_col and "DIR_STD" not in df.columns:
-        df["DIR_STD"] = df[dir_col].apply(normalize_direction_value)
-
-    return df
-
 def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Find address column(s) and combine them into a single ADDRESS column.
@@ -252,6 +202,7 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
         def combine_street_no_name(row):
             sno = str(row[sno_col]).strip() if pd.notna(row[sno_col]) else ""
             sname = str(row[sname_col]).strip() if pd.notna(row[sname_col]) else ""
+            # Remove trailing .0 from numeric street numbers read as float by pandas
             sno = re.sub(r'\.0$', '', sno)
             combined = f"{sno} {sname}".strip()
             return normalize_addr(combined)
@@ -260,7 +211,7 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
         st.info(f"✓ Combined {sno_col} and {sname_col} into ADDRESS column")
         return df
 
-    # Pattern 5: NUMBER + STREET columns (new client layout)
+    # Pattern 4b: NUMBER + STREET columns (new TP/ADJ format)
     if "NUMBER" in cols_upper and "STREET" in cols_upper:
         num_col = cols_upper["NUMBER"]
         street_col = cols_upper["STREET"]
@@ -276,7 +227,7 @@ def find_and_combine_address_columns(df: pd.DataFrame) -> pd.DataFrame:
         st.info(f"✓ Combined {num_col} and {street_col} into ADDRESS column")
         return df
 
-    # Pattern 6: Look for other common patterns
+    # Pattern 5: Look for other common patterns
     address_patterns = [
         "STREET ADDRESS", "STREET_ADDRESS", "PROPERTY ADDRESS",
         "PROPERTY_ADDRESS", "SITE ADDRESS", "LOCATION", "STREET", "ADDR"
@@ -536,55 +487,90 @@ def read_input(file) -> pd.DataFrame:
             df["ADDRESS"] = df["ADDRESS"].ffill().apply(normalize_addr)
         return df
 
-    # XLSX/XLS (requires openpyxl for .xlsx and xlrd for .xls)
+    # XLSX/XLS
     xls = pd.ExcelFile(file)
     raw = pd.read_excel(xls, sheet_name=0, header=None)
 
+    def row_tokens(i: int) -> list[str]:
+        return [str(v).strip().upper() for v in raw.iloc[i].tolist() if str(v).strip() and str(v).strip().upper() != "NAN"]
+
     header_row = None
-    # First try to find ADDRESS + YEAR (ERIS format)
+
+    # Look for the strongest header matches first
     for i in range(min(50, len(raw))):
-        row_vals = raw.iloc[i].astype(str).str.upper().tolist()
-        if "ADDRESS" in row_vals and "YEAR" in row_vals:
+        vals = set(row_tokens(i))
+
+        # Classic ADDRESS + YEAR format
+        if {"ADDRESS", "YEAR"}.issubset(vals):
             header_row = i
             break
 
-    # If not found, look for ADDRESS1 or COMPANY_NAME (other formats)
-    if header_row is None:
-        for i in range(min(50, len(raw))):
-            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
-            if ("ADDRESS1" in row_vals or "COMPANY_NAME" in row_vals):
-                header_row = i
-                break
+        # ADDRESS1/ADDRESS2 style
+        if "ADDRESS1" in vals or "COMPANY_NAME" in vals:
+            header_row = i
+            break
 
-    # If not found, look for TP/ADJ format (STREET NO + STREET NAME + OCCUPANT NAME)
-    if header_row is None:
-        for i in range(min(50, len(raw))):
-            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
-            if "STREET NO" in row_vals and "STREET NAME" in row_vals:
-                header_row = i
-                break
+        # Old TP/ADJ style
+        if {"STREET NO", "STREET NAME"}.issubset(vals):
+            header_row = i
+            break
 
-    # If not found, look for newer format (YEAR + NUMBER + STREET + OCCUPANT NAME)
+        # New TP/ADJ style
+        if {"YEAR", "NUMBER", "STREET"}.issubset(vals):
+            header_row = i
+            break
+
+        if {"YEAR", "NUMBER", "STREET", "OCCUPANT NAME"}.issubset(vals):
+            header_row = i
+            break
+
+    # Fallback: score rows to find likely header
     if header_row is None:
+        best_score = -1
+        best_idx = None
+        signal_cols = {
+            "YEAR", "ADDRESS", "ADDRESS1", "ADDRESS2", "COMPANY_NAME",
+            "STREET NO", "STREET NAME", "NUMBER", "STREET",
+            "OCCUPANT NAME", "LISTING", "DIR", "FEET", "MILES", "PUBLISHER"
+        }
         for i in range(min(50, len(raw))):
-            row_vals = raw.iloc[i].astype(str).str.upper().tolist()
-            if "YEAR" in row_vals and "NUMBER" in row_vals and ("STREET" in row_vals or "STREET " in row_vals) and "OCCUPANT NAME" in row_vals:
-                header_row = i
-                break
+            vals = set(row_tokens(i))
+            score = len(vals.intersection(signal_cols))
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        if best_score >= 2:
+            header_row = best_idx
 
     if header_row is None:
         df = pd.read_excel(xls, sheet_name=0)
         df.columns = [str(c).strip().upper() for c in df.columns]
-        if "ADDRESS" in df.columns:
-            df["ADDRESS"] = df["ADDRESS"].ffill().apply(normalize_addr)
-        return df
+    else:
+        df = pd.read_excel(xls, sheet_name=0, header=header_row)
+        df.columns = [str(c).strip().upper() for c in df.columns]
 
-    df = pd.read_excel(xls, sheet_name=0, header=header_row)
-    df.columns = [str(c).strip().upper() for c in df.columns]
+    # Drop completely empty rows/cols and unnamed junk columns when possible
+    df = df.dropna(how="all")
+    if len(df.columns) > 0:
+        keep_cols = []
+        for c in df.columns:
+            cu = str(c).strip().upper()
+            if not cu.startswith("UNNAMED:") or df[c].notna().any():
+                keep_cols.append(c)
+        df = df[keep_cols]
 
-    # Only filter by YEAR if the column exists
+    # Normalize YEAR presence
     if "YEAR" in df.columns:
         df = df[df["YEAR"].notna()]
+
+    # New TP/ADJ files sometimes store TP/ADJ labels under FEET or MILES.
+    if "TP/ADJ" not in df.columns:
+        for candidate in ["FEET", "MILES"]:
+            if candidate in df.columns:
+                vals = df[candidate].dropna().astype(str).str.strip().str.upper()
+                if not vals.empty and vals.isin(["TP", "ADJ"]).mean() > 0.5:
+                    df["TP/ADJ"] = vals
+                    break
 
     if "ADDRESS" in df.columns:
         df["ADDRESS"] = df["ADDRESS"].ffill().apply(normalize_addr)
@@ -592,38 +578,36 @@ def read_input(file) -> pd.DataFrame:
     return df
 
 def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
-    """Group by YEAR and combine listings into comma-separated unique string."""
+    """Group by YEAR label and combine listings into a comma-separated unique string."""
 
-    # Check if YEAR column exists
     has_year = "YEAR" in df_addr.columns
 
     if not has_year and "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
 
-    # Format WITHOUT year data
     if not has_year:
         t = df_addr[["LISTING"]].copy()
         t["LISTING"] = t["LISTING"].astype(str).str.strip()
         t = t[t["LISTING"].str.len() > 0]
 
-        # Remove duplicates
         unique_listings = t["LISTING"].drop_duplicates().tolist()
-
-        result = pd.DataFrame({
+        return pd.DataFrame({
             "Year(s)": ["N/A"] * len(unique_listings),
             "Occupant Listed": unique_listings
         })
-        return result
 
-    # Format WITH year data (original logic)
     if "LISTING" not in df_addr.columns:
         return pd.DataFrame(columns=["Year(s)", "Occupant Listed"])
 
     t = df_addr[["YEAR", "LISTING"]].copy()
-    t["YEAR"] = pd.to_numeric(t["YEAR"], errors="coerce")
-    t = t.dropna(subset=["YEAR"])
-    t["YEAR"] = t["YEAR"].astype(int)
+    t["YEAR_LABEL"] = t["YEAR"].astype(str).str.strip()
+    t = t[
+        t["YEAR_LABEL"].notna()
+        & (t["YEAR_LABEL"] != "")
+        & (t["YEAR_LABEL"].str.upper() != "NAN")
+    ].copy()
 
+    t["YEAR_SORT"] = t["YEAR_LABEL"].apply(extract_year_sort_value)
     t["LISTING"] = t["LISTING"].astype(str).str.strip()
     t = t[t["LISTING"].str.len() > 0]
 
@@ -637,10 +621,12 @@ def format_year_listing(df_addr: pd.DataFrame) -> pd.DataFrame:
         return ", ".join(out)
 
     grouped = (
-        t.sort_values(["YEAR", "LISTING"], ascending=[True, True])
-         .groupby("YEAR", as_index=False)["LISTING"]
+        t.sort_values(["YEAR_SORT", "YEAR_LABEL", "LISTING"], ascending=[True, True, True])
+         .groupby(["YEAR_LABEL", "YEAR_SORT"], as_index=False)["LISTING"]
          .apply(combine_listings)
-         .rename(columns={"YEAR": "Year(s)", "LISTING": "Occupant Listed"})
+         .rename(columns={"YEAR_LABEL": "Year(s)", "LISTING": "Occupant Listed"})
+         .sort_values(["YEAR_SORT", "Year(s)"], ascending=[True, True])
+         .drop(columns=["YEAR_SORT"])
          .reset_index(drop=True)
     )
     return grouped
@@ -654,6 +640,8 @@ def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
     Into:
       1970-1971 A
       1972 B
+
+    Only compresses when every year label is a single numeric year.
     """
     if out_df.empty:
         return []
@@ -661,16 +649,23 @@ def compress_year_runs(out_df: pd.DataFrame) -> list[tuple[str, str]]:
     years = out_df["Year(s)"].tolist()
     occs = out_df["Occupant Listed"].tolist()
 
-    # If no year data (all "N/A"), just return the listings
     if all(str(y) == "N/A" for y in years):
         return [(y, occ) for y, occ in zip(years, occs)]
 
+    def single_year_int(value):
+        s = str(value).strip()
+        return int(s) if re.fullmatch(r"\d{4}", s) else None
+
+    parsed_years = [single_year_int(y) for y in years]
+    if any(y is None for y in parsed_years):
+        return [(str(y), occ) for y, occ in zip(years, occs)]
+
     rows: list[tuple[str, str]] = []
-    start_y = years[0]
-    prev_y = years[0]
+    start_y = parsed_years[0]
+    prev_y = parsed_years[0]
     prev_occ = occs[0]
 
-    for y, occ in zip(years[1:], occs[1:]):
+    for y, occ in zip(parsed_years[1:], occs[1:]):
         contiguous = (y == prev_y + 1)
         same_occ = (occ == prev_occ)
         if contiguous and same_occ:
@@ -758,21 +753,32 @@ def build_subject_report_docx(subject_selected: list[str], df: pd.DataFrame) -> 
     hdr_cells[1].text = "Subject Property Address(es) — Occupant Listed"
     set_table_header_style(table)
 
+    subject_rows = []
+
     for addr in subject_selected:
         block = df[df["ADDRESS"] == addr].copy()
         out = format_year_listing(block)
         runs = compress_year_runs(out)
 
         if not runs:
-            row = table.add_row().cells
-            row[0].text = ""
-            row[1].text = f"{addr} — No results"
+            subject_rows.append((999999, parse_address_for_sort(addr), "", addr, "No results"))
             continue
 
         for year_label, occ in runs:
-            row = table.add_row().cells
-            row[0].text = str(year_label)
-            row[1].text = f"{addr} — {occ}"
+            subject_rows.append((
+                extract_year_sort_value(year_label),
+                parse_address_for_sort(addr),
+                str(year_label),
+                addr,
+                occ
+            ))
+
+    subject_rows.sort(key=lambda item: (item[0], item[1]))
+
+    for _, _, year_label, addr, occ in subject_rows:
+        row = table.add_row().cells
+        row[0].text = str(year_label)
+        row[1].text = f"{addr} — {occ}"
 
     return docx_bytes(doc)
 
@@ -848,10 +854,7 @@ if not uploaded:
     st.stop()
 
 df = read_input(uploaded)
-df.columns = [str(c).strip().upper() for c in df.columns]
-
-# Infer newer layout helper columns before downstream processing
-df = infer_tp_adj_columns(df)
+df.columns = [c.upper() for c in df.columns]
 
 # Find and combine address columns
 df = find_and_combine_address_columns(df)
@@ -875,22 +878,16 @@ if "YEAR" not in df.columns:
 
 # Info message for TP/ADJ format
 if "TP/ADJ" in df.columns:
-    tp_series = df["TP/ADJ"].astype(str).str.upper().str.strip()
-    tp_count = (tp_series == "TP").sum()
-    adj_count = (tp_series == "ADJ").sum()
+    tp_count = (df["TP/ADJ"].str.upper() == "TP").sum()
+    adj_count = (df["TP/ADJ"].str.upper() == "ADJ").sum()
     st.info(
-        f"ℹ️ TP/ADJ data detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
-        f"All unique addresses will be available in both pickers, matching the older file behavior."
+        f"ℹ️ TP/ADJ format detected — {tp_count:,} subject (TP) rows and {adj_count:,} adjoining (ADJ) rows found. "
+        f"Use the pickers below to select addresses as usual."
     )
 
 # ✅ UPDATED SORTING: street name alpha, then house number numeric, then unit numeric
 all_addresses = [a for a in df["ADDRESS"].dropna().unique() if str(a).strip()]
 all_addresses = sorted(all_addresses, key=parse_address_for_sort)
-
-# Keep the old picker behavior for every format:
-# show the full unique-address list in both the Subject and Adjoining pickers.
-subject_address_options = all_addresses
-adjoining_address_options = all_addresses
 
 st.success(f"Loaded {len(df):,} rows • Found {len(all_addresses):,} unique addresses")
 
@@ -930,12 +927,12 @@ ui_left, ui_right = st.columns(2)
 
 with ui_left:
     st.subheader("Pick Subject Property Addresses")
-    subject_selected = st.multiselect("Subject addresses", subject_address_options, key="subject_sel", placeholder="Choose address")
+    subject_selected = st.multiselect("Subject addresses", all_addresses, key="subject_sel", placeholder="Choose address")
     st.button("CREATE SUBJECT PROPERTY TABLES", use_container_width=True, on_click=set_run_subject)
 
 with ui_right:
     st.subheader("Pick Adjoining Property Addresses")
-    adjoining_selected = st.multiselect("Adjoining addresses", adjoining_address_options, key="adjoining_sel", placeholder="Choose address")
+    adjoining_selected = st.multiselect("Adjoining addresses", all_addresses, key="adjoining_sel", placeholder="Choose address")
     st.button("CREATE ADJOINING PROPERTY TABLES", use_container_width=True, on_click=set_run_adjoining)
 
 st.button("CLEAR ALL", use_container_width=True, on_click=clear_all)
@@ -976,13 +973,7 @@ with out_right:
             for a in adjoining_selected:
                 key = f"dir_{a}"
                 if a not in st.session_state["dir_map"]:
-                    inferred_dir = ""
-                    if "DIR_STD" in df.columns:
-                        matches = df.loc[df["ADDRESS"] == a, "DIR_STD"].dropna().astype(str)
-                        matches = [m for m in matches if m.strip()]
-                        if matches:
-                            inferred_dir = matches[0]
-                    st.session_state["dir_map"][a] = inferred_dir
+                    st.session_state["dir_map"][a] = ""
                 picked = st.selectbox(a, dir_opts, index=dir_opts.index(st.session_state["dir_map"][a]), key=key)
                 st.session_state["dir_map"][a] = picked
 
